@@ -16,9 +16,9 @@ CH2 = 20
 PULSE = 5
 
 # max motor runtime in seconds
-class wipercontrol:
+class pimc:
     def __init__(self, journal_filename="pimc_status",fake_it=False, open_pulses=11, close_pulses=11, maxtime=30, logger=None, resume=False):
-        """Initialize a new wipercontrol object
+        """Initialize a new pimc object
         Args:
             journal_filename(str): Absolute or relative (to cwd) path to journal file. Must exist and be non-empty with current system state
             fake_it(bool): If true, all GPIO/motor interactions are emulated for testing.  WARNING: journal/state file will still be updated, ensure it is accurate before real usage
@@ -217,7 +217,8 @@ class wipercontrol:
         GPIO.setup(PULSE, GPIO.IN)
         self.gpio_initialized = True
         return True
-
+    def get_status(self):
+        return self.status
     def forward(self):
         """Run motor in the forward direction
         Args:
@@ -334,7 +335,7 @@ if __name__ == "__main__":
     parser.add_argument("--close-pulses", action="store", type=int, default=11, help="Override the number of pulses to close")
     parser.add_argument("--open-pulses", action="store", type=int, default=11, help="Override the number of pulses to open")
     parser.add_argument("--max-time", action="store", type=int, default=30, help="Maximum motor runtime per operation, in seconds")
-    parser.add_argument("--journal-filename", action="store", help="Path to the journal file")
+    parser.add_argument("--journal-filename", default="pimc_status", action="store", help="Path to the journal file")
     parser.add_argument("--fake", action="store_true", help="Fake all motor/GPIO interactions")
     parser.add_argument("--debug", action="store_true", help="Verbose logging for debugging")
     logging.basicConfig(level=logging.INFO)
@@ -343,11 +344,11 @@ if __name__ == "__main__":
 
     if args.debug:
         logger.setLevel(logging.DEBUG)
-    motor = wipercontrol(fake_it=args.fake, open_pulses=args.open_pulses, close_pulses=args.close_pulses, maxtime=args.max_time, logger=logger, resume=args.resume)
+    motorcontrol = pimc(fake_it=args.fake, open_pulses=args.open_pulses, close_pulses=args.close_pulses, maxtime=args.max_time, logger=logger, resume=args.resume, journal_filename=args.journal_filename)
     if args.action.lower() == "open":
-        motor.open()
+        motorcontrol.open()
     elif args.action.lower() == "close":
-        motor.close()
+        motorcontrol.close()
     elif args.action == 'status':
-        print(motor.status)
+        print(motorcontrol.status)
 
