@@ -26,7 +26,7 @@ class pimc:
             close_pulses(int): Number of pulses to detect for transition from open to closed state
             logger(obj): Logger object to use; will use root logger if none is passed
             resume(bool): Resume interrupted actions from journal file instead of throwing error"""
-        self.logger = logger or logging.getLogger()
+        self.logger = logger or logging.getLogger(__name__)
         self.journal_filename = journal_filename
         self.gpio_initialized = False
         self.journal_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
@@ -272,7 +272,7 @@ class pimc:
         # purge futures data structure
         self.journal_futures = {}
 
-    def open(self, pulses=None, resuming=False):
+    def action_open(self, pulses=None, resuming=False):
         """Run the motor the specified number of pulses to the fully-opened position
         Args:
             pulses(int): The number of pulses to run.  If not specified, the full number of pulses is used
@@ -296,10 +296,12 @@ class pimc:
         if result:
             print("Opened")
             self.update_status("open", use_future=False)
+            return True
         else:
             print("FAILED during open, hit max runtime")
             self.update_status("failed opening", use_future=False)
-    def close(self, pulses=None, resuming=False):
+            return False
+    def action_close(self, pulses=None, resuming=False):
         """Run the motor the specified number of pulses to the fully-closed position
         Args:
             pulses(int): The number of pulses to run.  If not specified, the full number of pulses is used
@@ -324,9 +326,33 @@ class pimc:
         if result:
             print("Closed")
             self.update_status("closed", use_future=False)
+            return True
         else:
             print("FAILED during close, hit max runtime")
             self.update_status("failed closing", use_future=False)
+            return False
+    def action_status(self):
+        """Print the current system status"""
+        print(self.status)
+
+    def run(self, action):
+        """
+        Run the requested action
+        Args:
+            action(str): Requested action
+        Returns:
+            action_output: Return value from the action's callable
+        """
+        callable_name = f"action_{action}"
+        self.logger.debug("action callable_name: %s", callable_name)
+        action_callable = getattr(motorcontrol, callable_name) if hasattr(motorcontrol, callable_name) else None
+        if action_callable is None:
+            self.logger.error("Could not find method for requested action `%s`", action)
+            return None
+        if not callable(action_callable):
+            self.logger.error("%s is not callable", callable_name)
+        action_callable()
+            
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -345,10 +371,5 @@ if __name__ == "__main__":
     if args.debug:
         logger.setLevel(logging.DEBUG)
     motorcontrol = pimc(fake_it=args.fake, open_pulses=args.open_pulses, close_pulses=args.close_pulses, maxtime=args.max_time, logger=logger, resume=args.resume, journal_filename=args.journal_filename)
-    if args.action.lower() == "open":
-        motorcontrol.open()
-    elif args.action.lower() == "close":
-        motorcontrol.close()
-    elif args.action == 'status':
-        print(motorcontrol.status)
-
+    action = args.action.lower().strip()
+    motorcontrol.run(action)
