@@ -17,7 +17,7 @@ PULSE = 5
 
 # max motor runtime in seconds
 class pimc:
-    def __init__(self, journal_filename="pimc_status",fake_it=False, open_pulses=11, close_pulses=11, maxtime=30, logger=None, resume=False):
+    def __init__(self, journal_filename="pimc_status",fake_it=False, open_pulses=11, close_pulses=11, maxtime=30, logger=None, resume=False, open_seconds=10, close_seconds=10):
         """Initialize a new pimc object
         Args:
             journal_filename(str): Absolute or relative (to cwd) path to journal file. Must exist and be non-empty with current system state
@@ -35,7 +35,9 @@ class pimc:
         self.faking_it = fake_it
         self.open_pulses = open_pulses
         self.close_pulses = close_pulses
-        self.maxtime = 30
+        self.open_seconds = open_seconds
+        self.close_seconds = close_seconds
+        self.maxtime = maxtime
         self.status = self.load_journal()
         if not self.faking_it:
             self.gpio_setup()
@@ -151,6 +153,7 @@ class pimc:
         pulses_seen = 0
         last_state = None
         start_time = time.time()
+        last_pulse = start_time
         while time.time() - start_time < self.maxtime and pulses_seen < pulses:
             self.cleanup_completed_journal_futures()
             time.sleep(0.050)
@@ -162,6 +165,8 @@ class pimc:
                 continue
             if state > last_state:
                 self.logger.debug("Pulse seen.  Now %s/%s", pulses_seen, pulses)
+                self.logger.debug("Time since last pulse: %s", time.time()-last_pulse)
+                last_pulse = time.time()
                 pulses_seen += 1
                 if status:
                     self.update_status(f"{status} {pulses-pulses_seen}")
@@ -272,7 +277,7 @@ class pimc:
         # purge futures data structure
         self.journal_futures = {}
 
-    def action_open(self, pulses=None, resuming=False):
+    def action_open(self, pulses=None, seconds=None, resuming=False):
         """Run the motor the specified number of pulses to the fully-opened position
         Args:
             pulses(int): The number of pulses to run.  If not specified, the full number of pulses is used
@@ -288,10 +293,14 @@ class pimc:
             return False
         if not resuming:
             self.update_status("opening")
-        if self.faking_it:
-            result = self.fake_wait_pulses(pulses, status="opening")
-        else:
-            result = self.wait_pulses(pulses, status="opening")
+        if pulses:
+            if self.faking_it:
+                result = self.fake_wait_pulses(pulses, status="opening")
+            else:
+                result = self.wait_pulses(pulses, status="opening")
+        if seconds:
+            time.sleep(seconds)
+            result = True
         self.stop_and_housekeeping()
         if result:
             print("Opened")
@@ -301,7 +310,7 @@ class pimc:
             print("FAILED during open, hit max runtime")
             self.update_status("failed opening", use_future=False)
             return False
-    def action_close(self, pulses=None, resuming=False):
+    def action_close(self, pulses=None, seconds=None, resuming=False):
         """Run the motor the specified number of pulses to the fully-closed position
         Args:
             pulses(int): The number of pulses to run.  If not specified, the full number of pulses is used
@@ -318,10 +327,14 @@ class pimc:
             return False
         if not resuming:
             self.update_status("closing")
-        if self.faking_it:
-            result = self.fake_wait_pulses(pulses, status="closing")
-        else:
-            result = self.wait_pulses(pulses, "closing")
+        if pulses:
+            if self.faking_it:
+                result = self.fake_wait_pulses(pulses, status="closing")
+            else:
+                result = self.wait_pulses(pulses, "closing")
+        if seconds:
+            time.sleep(seconds)
+            result = True
         self.stop_and_housekeeping()
         if result:
             print("Closed")
@@ -360,6 +373,8 @@ if __name__ == "__main__":
     parser.add_argument("--resume", action="store_true", help="Resume any prior journaled action before taking new action")
     parser.add_argument("--close-pulses", action="store", type=int, default=11, help="Override the number of pulses to close")
     parser.add_argument("--open-pulses", action="store", type=int, default=11, help="Override the number of pulses to open")
+    parser.add_argument("--close-seconds", action="store", type=int, default=None, help="Override the number of seconds to close")
+    parser.add_argument("--open-seconds", action="store", type=int, default=None, help="Override the number of seconds to open")
     parser.add_argument("--max-time", action="store", type=int, default=30, help="Maximum motor runtime per operation, in seconds")
     parser.add_argument("--journal-filename", default="pimc_status", action="store", help="Path to the journal file")
     parser.add_argument("--fake", action="store_true", help="Fake all motor/GPIO interactions")
