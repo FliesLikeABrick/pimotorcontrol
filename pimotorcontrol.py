@@ -387,4 +387,9 @@ if __name__ == "__main__":
         logger.setLevel(logging.DEBUG)
     motorcontrol = pimc(fake_it=args.fake, open_pulses=args.open_pulses, close_pulses=args.close_pulses, maxtime=args.max_time, logger=logger, resume=args.resume, journal_filename=args.journal_filename)
     action = args.action.lower().strip()
-    motorcontrol.run(action)
+
+    try:
+        motorcontrol.run(action)
+    except KeyboardInterrupt:
+        logging.warning('Interrupted')
+        motorcontrol.stop_and_housekeeping()
