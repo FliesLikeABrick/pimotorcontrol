@@ -17,7 +17,7 @@ PULSE = 5
 
 # max motor runtime in seconds
 class pimc:
-    def __init__(self, journal_filename="pimc_status",fake_it=False, open_pulses=11, close_pulses=11, maxtime=30, logger=None, resume=False):
+    def __init__(self, journal_filename="pimc_status",fake_it=False, open_pulses=11, close_pulses=11, maxtime=30, logger=None, resume=False, open_seconds=10, close_seconds=10):
         """Initialize a new pimc object
         Args:
             journal_filename(str): Absolute or relative (to cwd) path to journal file. Must exist and be non-empty with current system state
@@ -26,7 +26,7 @@ class pimc:
             close_pulses(int): Number of pulses to detect for transition from open to closed state
             logger(obj): Logger object to use; will use root logger if none is passed
             resume(bool): Resume interrupted actions from journal file instead of throwing error"""
-        self.logger = logger or logging.getLogger()
+        self.logger = logger or logging.getLogger(__name__)
         self.journal_filename = journal_filename
         self.gpio_initialized = False
         self.journal_executor = concurrent.futures.ThreadPoolExecutor(max_workers=8)
@@ -35,7 +35,9 @@ class pimc:
         self.faking_it = fake_it
         self.open_pulses = open_pulses
         self.close_pulses = close_pulses
-        self.maxtime = 30
+        self.open_seconds = open_seconds
+        self.close_seconds = close_seconds
+        self.maxtime = maxtime
         self.status = self.load_journal()
         if not self.faking_it:
             self.gpio_setup()
@@ -151,6 +153,7 @@ class pimc:
         pulses_seen = 0
         last_state = None
         start_time = time.time()
+        last_pulse = start_time
         while time.time() - start_time < self.maxtime and pulses_seen < pulses:
             self.cleanup_completed_journal_futures()
             time.sleep(0.050)
@@ -162,6 +165,8 @@ class pimc:
                 continue
             if state > last_state:
                 self.logger.debug("Pulse seen.  Now %s/%s", pulses_seen, pulses)
+                self.logger.debug("Time since last pulse: %s", time.time()-last_pulse)
+                last_pulse = time.time()
                 pulses_seen += 1
                 if status:
                     self.update_status(f"{status} {pulses-pulses_seen}")
@@ -271,14 +276,22 @@ class pimc:
             self.logger.debug("Cleaned up future %s", self.journal_futures[future])
         # purge futures data structure
         self.journal_futures = {}
-
-    def open(self, pulses=None, resuming=False):
+    def action_open_pulses(self):
+        """
+        Handle user open-pulses request based on configuration
+        """
+        return self.open(pulses=self.pulses)
+    def action_open_seconds(self):
+        """
+        Handle user open-seconds request based on configuration
+        """
+        return self.open(seconds=self.open_seconds)
+    def open(self, pulses=None, seconds=None, resuming=False):
         """Run the motor the specified number of pulses to the fully-opened position
         Args:
             pulses(int): The number of pulses to run.  If not specified, the full number of pulses is used
             resuming(bool): Specifies whether this operation is resuming an interrupted operation, to perform proper checks and status/journal updates
-        """
-        pulses = self.open_pulses if pulses is None else pulses
+        """        
         if not resuming:
             if self.status != "closed":
                 print(f"Journal says status is {self.status}, not opening")
@@ -288,24 +301,41 @@ class pimc:
             return False
         if not resuming:
             self.update_status("opening")
-        if self.faking_it:
-            result = self.fake_wait_pulses(pulses, status="opening")
-        else:
-            result = self.wait_pulses(pulses, status="opening")
+        if pulses:
+            self.logger.debug("Waiting %s pulses", pulses)
+            if self.faking_it:
+                result = self.fake_wait_pulses(pulses, status="opening")
+            else:
+                result = self.wait_pulses(pulses, status="opening")
+        if seconds:
+            self.logger.debug("Waiting %s seconds", seconds)
+            time.sleep(seconds)
+            result = True
         self.stop_and_housekeeping()
         if result:
             print("Opened")
             self.update_status("open", use_future=False)
+            return True
         else:
             print("FAILED during open, hit max runtime")
             self.update_status("failed opening", use_future=False)
-    def close(self, pulses=None, resuming=False):
+            return False
+    def action_close_pulses(self):
+        """
+        Handle user close-pulses request based on configuration
+        """
+        return self.close(pulses=self.pulses)
+    def action_close_seconds(self):
+        """
+        Handle user close-seconds request based on configuration
+        """
+        return self.close(seconds=self.close_seconds)
+    def close(self, pulses=None, seconds=None, resuming=False):
         """Run the motor the specified number of pulses to the fully-closed position
         Args:
             pulses(int): The number of pulses to run.  If not specified, the full number of pulses is used
             resuming(bool): Specifies whether this operation is resuming an interrupted operation, to perform proper checks and status/journal updates
         """
-        pulses = self.close_pulses if pulses is None else pulses
         self.logger.info("Closing....")
         if not resuming:
             if self.status != "open":
@@ -316,39 +346,79 @@ class pimc:
             return False
         if not resuming:
             self.update_status("closing")
-        if self.faking_it:
-            result = self.fake_wait_pulses(pulses, status="closing")
-        else:
-            result = self.wait_pulses(pulses, "closing")
+        if pulses:
+            if self.faking_it:
+                result = self.fake_wait_pulses(pulses, status="closing")
+            else:
+                result = self.wait_pulses(pulses, "closing")
+        if seconds:
+            time.sleep(seconds)
+            result = True
         self.stop_and_housekeeping()
         if result:
             print("Closed")
             self.update_status("closed", use_future=False)
+            return True
         else:
             print("FAILED during close, hit max runtime")
             self.update_status("failed closing", use_future=False)
+            return False
+    def action_status(self):
+        """Print the current system status"""
+        print(self.status)
+
+    def run(self, action):
+        """
+        Run the requested action
+        Args:
+            action(str): Requested action
+        Returns:
+            action_output: Return value from the action's callable
+        """
+        callable_name = f"action_{action.replace('-','_')}"
+        self.logger.debug("action callable_name: %s", callable_name)
+        action_callable = getattr(motorcontrol, callable_name) if hasattr(motorcontrol, callable_name) else None
+        if action_callable is None:
+            self.logger.error("Could not find method for requested action `%s`", action)
+            return None
+        if not callable(action_callable):
+            self.logger.error("%s is not callable", callable_name)
+        action_callable()
+            
 
 if __name__ == "__main__":
+    def get_action_choices():
+        action_attributes = [attribute for attribute in dir(pimc) if attribute[0:7] == 'action_']
+        availble_actions = []
+        for attribute in action_attributes:
+            if len(attribute) <= 7:
+                continue
+            availble_actions.append(attribute.replace('_','-'))
+    
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", action="store", choices=['open','close','status'])
+    parser.add_argument("action", action="store", choices=get_action_choices())
     parser.add_argument("--resume", action="store_true", help="Resume any prior journaled action before taking new action")
     parser.add_argument("--close-pulses", action="store", type=int, default=11, help="Override the number of pulses to close")
     parser.add_argument("--open-pulses", action="store", type=int, default=11, help="Override the number of pulses to open")
+    parser.add_argument("--close-seconds", action="store", type=int, default=None, help="Override the number of seconds to close")
+    parser.add_argument("--open-seconds", action="store", type=int, default=None, help="Override the number of seconds to open")
     parser.add_argument("--max-time", action="store", type=int, default=30, help="Maximum motor runtime per operation, in seconds")
     parser.add_argument("--journal-filename", default="pimc_status", action="store", help="Path to the journal file")
     parser.add_argument("--fake", action="store_true", help="Fake all motor/GPIO interactions")
     parser.add_argument("--debug", action="store_true", help="Verbose logging for debugging")
-    logging.basicConfig(level=logging.INFO)
-    logger = logging.getLogger()
+    logger = logging.getLogger(__name__)
     args = parser.parse_args()
 
     if args.debug:
-        logger.setLevel(logging.DEBUG)
-    motorcontrol = pimc(fake_it=args.fake, open_pulses=args.open_pulses, close_pulses=args.close_pulses, maxtime=args.max_time, logger=logger, resume=args.resume, journal_filename=args.journal_filename)
-    if args.action.lower() == "open":
-        motorcontrol.open()
-    elif args.action.lower() == "close":
-        motorcontrol.close()
-    elif args.action == 'status':
-        print(motorcontrol.status)
+        logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s %(funcName)s: %(message)s (%(filename)s %(lineno)d)")
+    else:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
+    motorcontrol = pimc(fake_it=args.fake, open_pulses=args.open_pulses, close_pulses=args.close_pulses, maxtime=args.max_time, logger=logger, resume=args.resume, journal_filename=args.journal_filename, open_seconds=args.open_seconds, close_seconds=args.close_seconds)
+    action = args.action.lower().strip()
+
+    try:
+        motorcontrol.run(action)
+    except KeyboardInterrupt:
+        logging.warning('Interrupted')
+        motorcontrol.stop_and_housekeeping()
