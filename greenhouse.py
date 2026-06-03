@@ -1,10 +1,11 @@
+import argparse
 import json
 import logging
 import os
 import sys
 import time
 
-from pimotorcontrol import MCP3008PositionSensor, pimc
+from pimotorcontrol import MCP3008PositionSensor, pimc, voltage_to_pct
 from ds18b20 import ds18b20
 
 # -----------------------------------------------------------------------------
@@ -23,6 +24,9 @@ from ds18b20 import ds18b20
 #
 #   Example crontab entry (runs every 5 minutes):
 #     */5 * * * * /usr/bin/python3 /home/pi/greenhouse.py >> /var/log/greenhouse.log 2>&1
+#
+#   For verbose logging during testing:
+#     python3 greenhouse.py --debug
 #
 # FAULT SAFETY AND JOURNAL FILE:
 #
@@ -62,16 +66,63 @@ from ds18b20 import ds18b20
 #     temp_close < temperature < temp_open => do nothing
 #
 #   The gap between temp_close and temp_open is the deadband. Default is
-#   70F (close) to 80F (open), giving a 10F deadband.
+#   75F (close) to 85F (open), giving a 10F deadband.
+#
+# TELEMETRY:
+#
+#   If a TelemetryClient instance is provided at instantiation, the controller
+#   will emit events to Elasticsearch after each control cycle. Telemetry
+#   failures are non-fatal — a failure to emit never faults the controller.
+#   Telemetry is optional; if no client is provided, all emit calls are skipped.
+#
+#   Events are emitted to the pi-events index. All action, result, and
+#   event_type field values are prefixed with 'greenhouse_vent_' to namespace
+#   them within the shared index. This prevents field value collisions with
+#   other sources and makes Kibana queries unambiguous.
+#
+#   Event document fields:
+#     event_type:        'greenhouse_vent_action'
+#     action:            e.g. 'greenhouse_vent_opened_increment'
+#     result:            e.g. 'greenhouse_vent_success', 'greenhouse_vent_fault'
+#     level:             'info', 'warn', or 'error' (un-prefixed, generic severity)
+#     description:       human-readable context, mirrors the log message (un-prefixed,
+#                        free-text field — namespacing adds no value here)
+#     temperature_f:     the temperature reading that drove the decision
+#     position_voltage:  current ADC voltage at time of emit (if readable)
 # -----------------------------------------------------------------------------
 
 
 class GreenhouseVentController:
 
+    # -------------------------------------------------------------------------
+    # Telemetry field value constants
+    # -------------------------------------------------------------------------
+    # All action, result, and event_type values are defined as class constants
+    # so that they are consistent across emit calls and easy to update if the
+    # naming convention changes. The 'greenhouse_vent_' prefix namespaces these
+    # values within the shared pi-events index.
+    #
+    # level values ('info', 'warn', 'error') and description are intentionally
+    # un-prefixed: level is a generic cross-source severity field (analogous to
+    # a log level) whose value as a common field depends on consistency across
+    # all sources; description is free-text and namespacing adds no value.
+    # -------------------------------------------------------------------------
+    EVENT_TYPE = "greenhouse_vent_action"
+
+    ACTION_OPENED       = "greenhouse_vent_opened_increment"
+    ACTION_CLOSED       = "greenhouse_vent_closed_increment"
+    ACTION_NO_ACTION    = "greenhouse_vent_no_action"
+
+    RESULT_SUCCESS      = "greenhouse_vent_success"
+    RESULT_FAULT        = "greenhouse_vent_fault"
+    RESULT_AT_LIMIT     = "greenhouse_vent_at_limit"
+    RESULT_DEADBAND     = "greenhouse_vent_deadband"
+
     def __init__(self, motor, get_temperature,
-                 temp_open=80.0,
-                 temp_close=70.0,
+                 temp_open=85.0,
+                 temp_close=75.0,
                  journal_file="greenhouse_status.json",
+                 telemetry=None,
                  logger=None):
         """Initialize the GreenhouseVentController.
 
@@ -86,13 +137,17 @@ class GreenhouseVentController:
                                        any sensor library or mock can be used
                                        without modifying this class.
             temp_open(float): Temperature in Fahrenheit at or above which the
-                              vents should be opened one increment. Default 80.0.
+                              vents should be opened one increment. Default 85.0.
             temp_close(float): Temperature in Fahrenheit at or below which the
-                               vents should be closed one increment. Default 70.0.
+                               vents should be closed one increment. Default 75.0.
             journal_file(str): Path to this controller's JSON journal file.
                                Used to persist fault state across cron invocations.
                                Distinct from pimc's own journal file. Default is
                                'greenhouse_status.json' in the current directory.
+            telemetry(TelemetryClient or None): Optional TelemetryClient instance
+                               for emitting events to Elasticsearch. If None,
+                               telemetry is disabled and no emit calls are made.
+                               Telemetry failures are always non-fatal regardless.
             logger(obj): Logger to use. Uses root logger if None.
         """
         if temp_close >= temp_open:
@@ -121,6 +176,7 @@ class GreenhouseVentController:
         self.temp_open = temp_open
         self.temp_close = temp_close
         self.journal_file = journal_file
+        self.telemetry = telemetry
         self.logger = logger or logging.getLogger(__name__)
 
     # -------------------------------------------------------------------------
@@ -249,6 +305,83 @@ class GreenhouseVentController:
             "last_action": action,
         })
 
+    def _emit_event(self, action, result, temperature, level="info",
+                    description=None, timestamp=None):
+        """Emit a vent action event to Elasticsearch via the telemetry client.
+
+        Called after each control cycle outcome. Telemetry failures are logged
+        but never raised — a failure to emit must never fault the controller.
+
+        If no telemetry client is configured, this method is a no-op.
+
+        All action, result, and event_type values use the 'greenhouse_vent_'
+        prefix to namespace them within the shared pi-events index. Use the
+        class constants (ACTION_*, RESULT_*, EVENT_TYPE) rather than raw
+        strings to ensure consistency.
+
+        Args:
+            action(str): What was attempted. Use ACTION_* class constants.
+                         e.g. self.ACTION_OPENED, self.ACTION_NO_ACTION
+            result(str): Outcome of the action. Use RESULT_* class constants.
+                         e.g. self.RESULT_SUCCESS, self.RESULT_FAULT
+            temperature(float or None): The temperature reading that drove the
+                         decision, in Fahrenheit.
+            level(str):  Event severity. 'info' for normal actions, 'warn' for
+                         at-limit and deadband no-ops, 'error' for faults.
+                         Un-prefixed — this is a generic cross-source field.
+                         Defaults to 'info'.
+            description(str or None): Human-readable context for the event,
+                         mirroring the log message. Particularly useful for
+                         non-nominal outcomes where the action and result alone
+                         do not explain what happened. Un-prefixed free-text field.
+                         Defaults to None (omitted from document if not provided).
+            timestamp(str or datetime or None): Timestamp for the event. Should
+                         be passed as the moment the decision was made for accurate
+                         Kibana timeline alignment. If None, the telemetry client
+                         generates one at emit time.
+
+        Returns:
+            None
+        """
+        if self.telemetry is None:
+            return
+
+        # Read current position voltage once and reuse for both the voltage
+        # and percentage fields. Avoids two ADC reads returning slightly
+        # different values due to pot wiper noise.
+        position_voltage = None
+        position_pct = None
+        try:
+            position_voltage = self.motor.read_position()
+            position_pct = voltage_to_pct(
+                position_voltage,
+                self.motor.voltage_fully_closed,
+                self.motor.voltage_fully_open
+            )
+        except Exception as e:
+            self.logger.debug("_emit_event: could not read position for telemetry: %s", e)
+
+        document = {
+            "event_type":   self.EVENT_TYPE,
+            "action":       action,
+            "result":       result,
+            "level":        level,
+        }
+
+        if description is not None:
+            document["description"] = description
+
+        if temperature is not None:
+            document["temperature_f"] = temperature
+
+        if position_voltage is not None:
+            document["position_voltage"] = position_voltage
+
+        if position_pct is not None:
+            document["position_pct"] = round(position_pct, 1)
+
+        self.telemetry.emit_event(document, timestamp=timestamp)
+
     def check_and_adjust(self):
         """Perform one temperature sample-and-respond cycle.
 
@@ -256,7 +389,8 @@ class GreenhouseVentController:
           1. Reads the current temperature via get_temperature()
           2. Evaluates against the deadband thresholds
           3. Calls open_increment() or close_increment() on the motor if needed
-          4. Returns a tuple of (action, temperature)
+          4. Emits a telemetry event if a telemetry client is configured
+          5. Returns a tuple of (action, temperature)
 
         Returning the temperature alongside the action avoids the need for a
         second sensor read in run() when writing the journal. The temperature
@@ -285,6 +419,13 @@ class GreenhouseVentController:
             temperature = self.get_temperature()
         except Exception as e:
             self.logger.error("Failed to read temperature: %s", e)
+            self._emit_event(
+                action=self.ACTION_NO_ACTION,
+                result=self.RESULT_FAULT,
+                temperature=None,
+                level="error",
+                description=f"Temperature read failed: {e}",
+            )
             return 'fault', None
 
         self.logger.info("Temperature reading: %.1fF (open threshold: %.1fF, close threshold: %.1fF)",
@@ -306,38 +447,147 @@ class GreenhouseVentController:
                              temperature, self.temp_open)
 
             if self.motor.is_fully_open():
-                self.logger.info("Vents are already fully open, no action taken")
+                # Read position once, reuse for log and telemetry.
+                pos_v = self.motor.read_position()
+                pos_pct = voltage_to_pct(pos_v, self.motor.voltage_fully_closed, self.motor.voltage_fully_open)
+                self.logger.info(
+                    "Vents are already fully open (%.3fV, %.1f%% open), no action taken",
+                    pos_v, pos_pct
+                )
+                self._emit_event(
+                    action=self.ACTION_OPENED,
+                    result=self.RESULT_AT_LIMIT,
+                    temperature=temperature,
+                    level="warn",
+                    description="Temperature above open threshold but vents already at fully open position.",
+                )
                 return 'no_action_fully_open', temperature
 
-            result = self.motor.open_increment()
-            if not result:
-                self.logger.error("open_increment() returned failure")
+            # Disable limit check since it was explicitly checked above. A duplicate
+            # check could only pick up on noise and confuse matters.
+            result = self.motor.open_increment(check_limits=False)
+
+            if result is False:
+                self.logger.error("open_increment() returned failure — see pimc logs for motor-level detail")
+                self._emit_event(
+                    action=self.ACTION_OPENED,
+                    result=self.RESULT_FAULT,
+                    temperature=temperature,
+                    level="error",
+                    description="open_increment() returned failure — see pimc logs for motor-level detail.",
+                )
                 return 'fault', temperature
 
-            self.logger.info("Opened one increment successfully")
-            return 'opened_increment', temperature
+            elif result is None:
+                pos_v = self.motor.read_position()
+                pos_pct = voltage_to_pct(pos_v, self.motor.voltage_fully_closed, self.motor.voltage_fully_open)
+                self.logger.info(
+                    "open_increment() reported already at limit (%.3fV, %.1f%% open), no movement occurred",
+                    pos_v, pos_pct
+                )
+                self._emit_event(
+                    action=self.ACTION_OPENED,
+                    result=self.RESULT_AT_LIMIT,
+                    temperature=temperature,
+                    level="warn",
+                    description="open_increment() reported already at or within tolerance of fully open position.",
+                )
+                return 'no_action_fully_open', temperature
+
+            else:
+                # pimc's open_increment already logged the final voltage and
+                # percentage via its own post-move log. No duplicate read needed here.
+                self.logger.info("Opened one increment successfully")
+                self._emit_event(
+                    action=self.ACTION_OPENED,
+                    result=self.RESULT_SUCCESS,
+                    temperature=temperature,
+                    level="info",
+                )
+                return 'opened_increment', temperature
 
         elif temperature <= self.temp_close:
             self.logger.info("Temperature %.1fF <= close threshold %.1fF, attempting to close one increment",
                              temperature, self.temp_close)
 
             if self.motor.is_fully_closed():
-                self.logger.info("Vents are already fully closed, no action taken")
+                # Read position once, reuse for log and telemetry.
+                pos_v = self.motor.read_position()
+                pos_pct = voltage_to_pct(pos_v, self.motor.voltage_fully_closed, self.motor.voltage_fully_open)
+                self.logger.info(
+                    "Vents are already fully closed (%.3fV, %.1f%% open), no action taken",
+                    pos_v, pos_pct
+                )
+                self._emit_event(
+                    action=self.ACTION_CLOSED,
+                    result=self.RESULT_AT_LIMIT,
+                    temperature=temperature,
+                    level="warn",
+                    description="Temperature below close threshold but vents already at fully closed position.",
+                )
                 return 'no_action_fully_closed', temperature
 
-            result = self.motor.close_increment()
-            if not result:
-                self.logger.error("close_increment() returned failure")
+            # Disable limit check since it was explicitly checked above. A duplicate
+            # check could only pick up on noise and confuse matters.
+            result = self.motor.close_increment(check_limits=False)
+
+            if result is False:
+                self.logger.error("close_increment() returned failure — see pimc logs for motor-level detail")
+                self._emit_event(
+                    action=self.ACTION_CLOSED,
+                    result=self.RESULT_FAULT,
+                    temperature=temperature,
+                    level="error",
+                    description="close_increment() returned failure — see pimc logs for motor-level detail.",
+                )
                 return 'fault', temperature
 
-            self.logger.info("Closed one increment successfully")
-            return 'closed_increment', temperature
+            elif result is None:
+                pos_v = self.motor.read_position()
+                pos_pct = voltage_to_pct(pos_v, self.motor.voltage_fully_closed, self.motor.voltage_fully_open)
+                self.logger.info(
+                    "close_increment() reported already at limit (%.3fV, %.1f%% open), no movement occurred",
+                    pos_v, pos_pct
+                )
+                self._emit_event(
+                    action=self.ACTION_CLOSED,
+                    result=self.RESULT_AT_LIMIT,
+                    temperature=temperature,
+                    level="warn",
+                    description="close_increment() reported already at or within tolerance of fully closed position.",
+                )
+                return 'no_action_fully_closed', temperature
+
+            else:
+                # pimc's close_increment already logged the final voltage and
+                # percentage via its own post-move log. No duplicate read needed here.
+                self.logger.info("Closed one increment successfully")
+                self._emit_event(
+                    action=self.ACTION_CLOSED,
+                    result=self.RESULT_SUCCESS,
+                    temperature=temperature,
+                    level="info",
+                )
+                return 'closed_increment', temperature
 
         else:
             # Temperature is within the deadband. This is the expected steady-state
             # outcome during a well-regulated day — most runs should land here.
-            self.logger.info("Temperature %.1fF is within deadband (%.1fF - %.1fF), no action taken",
-                             temperature, self.temp_close, self.temp_open)
+            pos_v = self.motor.read_position()
+            pos_pct = voltage_to_pct(pos_v, self.motor.voltage_fully_closed, self.motor.voltage_fully_open)
+            self.logger.info(
+                "Temperature %.1fF is within deadband (%.1fF - %.1fF), no action taken. "
+                "Current position: %.3fV (%.1f%% open)",
+                temperature, self.temp_close, self.temp_open, pos_v, pos_pct
+            )
+            self._emit_event(
+                action=self.ACTION_NO_ACTION,
+                result=self.RESULT_DEADBAND,
+                temperature=temperature,
+                level="info",
+                description=f"Temperature {temperature:.1f}F is within deadband "
+                            f"({self.temp_close:.1f}F - {self.temp_open:.1f}F).",
+            )
             return 'no_action_deadband', temperature
 
     def run(self):
@@ -396,74 +646,100 @@ class GreenhouseVentController:
 
 
 # -----------------------------------------------------------------------------
-# Example usage / entry point
-# -----------------------------------------------------------------------------
-#
-# This block shows how to wire up the controller for the greenhouse use case.
-# Adjust pin numbers, voltage thresholds, and temperature thresholds to match
-# your physical installation.
-#
-# To use from cron, either call this file directly (python3 greenhouse.py)
-# or import GreenhouseVentController and construct it from your own script.
+# Entry point
 # -----------------------------------------------------------------------------
 
 if __name__ == "__main__":
 
+    parser = argparse.ArgumentParser(
+        description="Greenhouse vent temperature controller.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  python3 greenhouse.py                        # normal cron run
+  python3 greenhouse.py --debug                # verbose logging for testing
+  python3 greenhouse.py --es-host 172.28.11.170 --es-api-key <key>  # with telemetry
+        """
+    )
+
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable verbose debug logging.")
+
+    # --- Telemetry args ---
+    # These are optional. If --es-api-key is not provided, telemetry is disabled
+    # and the controller runs normally without emitting to Elasticsearch.
+    parser.add_argument("--es-host", action="store", default="localhost",
+                        help="Elasticsearch host for telemetry (default: localhost).")
+    parser.add_argument("--es-port", action="store", type=int, default=9200,
+                        help="Elasticsearch port for telemetry (default: 9200).")
+    parser.add_argument("--es-api-key", action="store", default=None,
+                        help="Elasticsearch API key for telemetry. "
+                             "If not provided, telemetry is disabled.")
+
+    args = parser.parse_args()
+
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s %(levelname)s: %(message)s"
     )
 
+    logger = logging.getLogger(__name__)
+
+    # --- Telemetry client ---
+    # Only instantiated if --es-api-key is provided. Telemetry is optional —
+    # the controller runs normally without it.
+    telemetry = None
+    if args.es_api_key:
+        from telemetry import TelemetryClient
+        telemetry = TelemetryClient(
+            api_key=args.es_api_key,
+            host=args.es_host,
+            port=args.es_port,
+            source="greenhouse",
+            logger=logger,
+        )
+        logger.info("Telemetry enabled. host=%s port=%s", args.es_host, args.es_port)
+    else:
+        logger.debug("No --es-api-key provided, telemetry disabled.")
+
     # --- Temperature sensor ---
-    # Replace this placeholder with your actual DS18B20 (or other) read function.
-    # The function must take no arguments and return a float in Fahrenheit.
-    # Example: from my_sensor import read_temp_f
     def get_temperature():
         d = ds18b20.DS18B20()
         return d.get_temperature(unit=2)
-        raise NotImplementedError(
-            "Replace this placeholder with your actual temperature read function. "
-            "It should take no arguments and return a float in Fahrenheit."
-        )
 
     # --- ADC position sensor ---
-    # MCP3008 channel 0, 5V reference. Adjust channel and vref to match your wiring.
     sensor = MCP3008PositionSensor(channel=0, vref=3.3)
 
     # --- Motor controller ---
-    # Adjust voltage thresholds and increment to match your potentiometer's
-    # actual voltage range once you have measured it on your physical system.
-    #
-    # voltage_fully_closed: voltage when vents are physically closed
-    # voltage_fully_open:   voltage when vents are physically fully open
-    # voltage_increment:    how many volts to move per temperature check cycle
-    # voltage_tolerance:    acceptable margin for "close enough" to a target
     #
     # All values are in volts. Measure with a multimeter or by reading the ADC
     # directly:
-    #   python3 -c "from pimotorcontrol import MCP3008PositionSensor; s = MCP3008PositionSensor(); print(s.read())"
+    #   python3 -c "from pimotorcontrol import MCP3008PositionSensor; s = MCP3008PositionSensor(vref=3.3); print(s.read())"
     motor = pimc(
         journal_filename="pimc_status",
         position_sensor=sensor,
-        voltage_fully_closed=1.9,   # replace with measured value
-        voltage_fully_open=2.3,     # replace with measured value
-        voltage_increment=0.1,      # replace with desired step size
-        voltage_tolerance=0.05,
+        voltage_fully_closed=1.95,
+        voltage_fully_open=2.3,
+        voltage_increment=0.25,
+        voltage_tolerance=0.1,
         direction_fault_threshold=0.3,
         direction_settle_seconds=0.02,
         maxtime=2,
         ch1_pin=21,
         ch2_pin=20,
-        relay_mode="enable_direction"
+        relay_mode="enable_direction",
+        logger=logger,
     )
 
     # --- Vent controller ---
     controller = GreenhouseVentController(
         motor=motor,
         get_temperature=get_temperature,
-        temp_open=80.0,
-        temp_close=70.0,
+        temp_open=85.0,
+        temp_close=75.0,
         journal_file="greenhouse_status.json",
+        telemetry=telemetry,
+        logger=logger,
     )
 
     controller.run()

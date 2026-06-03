@@ -125,6 +125,57 @@ class MCP3008PositionSensor:
         self.spi.close()
 
 
+# -----------------------------------------------------------------------------
+# voltage_to_pct
+# -----------------------------------------------------------------------------
+# Module-level helper that converts a potentiometer voltage reading into a
+# percentage-open value given the configured fully-closed and fully-open
+# voltage thresholds.
+#
+# This is a standalone function rather than a pimc method for two reasons:
+#
+#   1. Callers that already have a fresh ADC reading cached (e.g. open_increment
+#      after a move completes) can pass it directly, avoiding a second ADC read
+#      that could return a slightly different value due to pot wiper noise.
+#      Consistent with the current_voltage caching pattern used elsewhere.
+#
+#   2. Scripts that use MCP3008PositionSensor directly without a pimc instance
+#      (e.g. greenhouse_metrics.py) can import and call this function with their
+#      own reading and configured thresholds, without needing a full pimc instance.
+#
+# The result is clamped to 0-100 to handle readings that drift slightly outside
+# the configured voltage range due to potentiometer wear or ADC noise.
+# -----------------------------------------------------------------------------
+
+def voltage_to_pct(voltage, voltage_fully_closed, voltage_fully_open):
+    """Convert a potentiometer voltage reading to a percentage-open value.
+
+    Calculates where the given voltage falls within the configured travel range
+    (voltage_fully_closed to voltage_fully_open) and returns it as a percentage.
+    Result is clamped to 0-100 to handle readings that drift slightly outside
+    the configured range due to potentiometer wear or ADC noise.
+
+    This function does not read the ADC — the caller is responsible for
+    providing a voltage reading. This allows callers that already have a cached
+    reading to reuse it, avoiding a second ADC read that could return a
+    slightly different value due to pot wiper noise.
+
+    Args:
+        voltage(float): The potentiometer voltage reading to convert, in volts.
+        voltage_fully_closed(float): The voltage corresponding to 0% open (fully closed).
+        voltage_fully_open(float): The voltage corresponding to 100% open (fully open).
+
+    Returns:
+        pct(float): Percentage open, clamped to 0.0-100.0.
+    """
+    travel = voltage_fully_open - voltage_fully_closed
+    if travel == 0:
+        # Avoid division by zero if misconfigured thresholds are identical.
+        return 0.0
+    pct = (voltage - voltage_fully_closed) / travel * 100.0
+    return max(0.0, min(100.0, pct))
+
+
 class pimc:
 
     # Valid relay_mode values.
@@ -219,7 +270,7 @@ class pimc:
             poll_interval_seconds(float): How long to sleep between ADC reads inside the
                                           run_until_voltage() loop. Controls both CPU usage and
                                           the responsiveness of position feedback. Defaults to
-                                          0.05s (50ms). For short moves (50-200ms total travel),
+                                          0.01s (10ms). For short moves (50-200ms total travel),
                                           smaller values give more position samples per move.
                                           Should be smaller than direction_settle_seconds so that
                                           at least one sample is taken during the settling period
@@ -584,7 +635,34 @@ class pimc:
         """
         return self.position_sensor.read()
 
-    def is_fully_open(self):
+    def read_position_pct(self):
+        """Read the current motor position as a percentage open.
+
+        Convenience method for callers that want a percentage and do not already
+        have a cached voltage reading. Calls read_position() once and passes the
+        result to voltage_to_pct().
+
+        Callers that already have a fresh voltage reading (e.g. after a move
+        completes) should call voltage_to_pct() directly with the cached value
+        rather than calling this method, to avoid a second ADC read that could
+        return a slightly different value due to pot wiper noise.
+
+        Requires position_sensor, voltage_fully_closed, and voltage_fully_open
+        to be configured at instantiation.
+
+        Args:
+            None
+
+        Returns:
+            pct(float): Current position as percentage open, clamped to 0.0-100.0.
+        """
+        return voltage_to_pct(
+            self.read_position(),
+            self.voltage_fully_closed,
+            self.voltage_fully_open
+        )
+
+    def is_fully_open(self, current_voltage=None):
         """Determine whether the motor is at or past the fully open position.
 
         Uses voltage_tolerance so that a motor that is physically stopped
@@ -592,27 +670,28 @@ class pimc:
         hard stops, or ADC noise) is still considered fully open.
 
         Args:
-            None
+            current_voltage(float): Optional voltage reading to re-use instead of sampling
 
         Returns:
             result(bool): True if current position is within tolerance of fully open
-                          or beyond it.
-        """
-        return self.read_position() >= (self.voltage_fully_open - self.voltage_tolerance)
+                          or beyond it. """
+        current_voltage = current_voltage if current_voltage is not None else self.read_position()
+        return current_voltage >= (self.voltage_fully_open - self.voltage_tolerance)
 
-    def is_fully_closed(self):
+    def is_fully_closed(self, current_voltage=None):
         """Determine whether the motor is at or past the fully closed position.
 
         Uses voltage_tolerance for the same reasons as is_fully_open().
 
         Args:
-            None
+            current_voltage(float): Optional voltage reading to re-use instead of sampling
 
         Returns:
             result(bool): True if current position is within tolerance of fully closed
                           or beyond it.
         """
-        return self.read_position() <= (self.voltage_fully_closed + self.voltage_tolerance)
+        current_voltage = current_voltage if current_voltage is not None else self.read_position()
+        return current_voltage <= (self.voltage_fully_closed + self.voltage_tolerance)
 
     def run_until_voltage(self, target_voltage, direction):
         """Run the motor until the ADC reads within tolerance of a target voltage.
@@ -769,7 +848,7 @@ class pimc:
         )
         return False
 
-    def open_increment(self):
+    def open_increment(self, check_limits=True):
         """Move the motor open by one voltage increment.
 
         Reads current position, computes a target voltage one increment higher,
@@ -783,12 +862,13 @@ class pimc:
         tolerance), no movement is attempted.
 
         Args:
-            None
+            check_limits(bool): Check whether the target is already fully open before calculating and executing a move; default True. Limits will still not be exceeded by a calculated move increment, but a proactive check will be skipped.
 
         Returns:
             success(bool): True if the increment was completed successfully.
                            False if already fully open, voltage_increment not set,
-                           or if a fault occurred.
+                           or if a fault occurred. None if no movement is needed 
+                           due to already being at limits (not a fault condition)
         """
         if self.voltage_increment is None:
             self.logger.error(
@@ -796,12 +876,14 @@ class pimc:
                 "Provide voltage_increment at construction time to use open_increment()."
             )
             return False
-
-        if self.is_fully_open():
-            self.logger.info("open_increment: already at fully open position, not moving")
-            return False
-
+        # cache this starting position to ensure consistency for checks and logging
+        # as fluttering marginal voltages could cause confusion during troubleshooting
         current_voltage = self.read_position()
+
+        if check_limits and self.is_fully_open(current_voltage):
+            self.logger.info("open_increment: already at or near enough fully open position (%.3fV), not moving", current_voltage)
+            return None
+
 
         # Compute target: one increment up, but no further than fully open.
         # This means the final increment may be smaller than voltage_increment
@@ -820,12 +902,27 @@ class pimc:
         result = self.run_until_voltage(target_voltage, direction='increasing')
         self.stop_and_housekeeping()
 
+        # Read final position once and reuse for both voltage and percentage
+        # logging, avoiding two ADC reads that could return differing values
+        # due to pot wiper noise.
+        final_voltage = self.read_position()
+        final_pct = voltage_to_pct(final_voltage, self.voltage_fully_closed, self.voltage_fully_open)
+
         if not result:
-            self.logger.error("open_increment: failed to reach target voltage")
+            self.logger.error(
+                "open_increment: failed to reach target voltage. "
+                "final=%.3fV (%.1f%% open) target=%.3fV",
+                final_voltage, final_pct, target_voltage
+            )
             self.update_status("failed opening", use_future=False)
+        else:
+            self.logger.info(
+                "open_increment: move complete. final=%.3fV (%.1f%% open)",
+                final_voltage, final_pct
+            )
         return result
 
-    def close_increment(self):
+    def close_increment(self, check_limits=True):
         """Move the motor closed by one voltage increment.
 
         Reads current position, computes a target voltage one increment lower,
@@ -839,7 +936,7 @@ class pimc:
         tolerance), no movement is attempted.
 
         Args:
-            None
+            check_limits(bool): Check whether the target is already fully closed before calculating and executing a move; default True.  Limits will still not be exceeded by a calculated move increment, but a proactive check will be skipped.
 
         Returns:
             success(bool): True if the increment was completed successfully.
@@ -853,11 +950,13 @@ class pimc:
             )
             return False
 
-        if self.is_fully_closed():
-            self.logger.info("close_increment: already at fully closed position, not moving")
-            return False
-
+        # cache this starting position to ensure consistency for checks and logging
+        # as fluttering marginal voltages could cause confusion during troubleshooting
         current_voltage = self.read_position()
+
+        if check_limits and self.is_fully_closed(current_voltage):
+            self.logger.info("close_increment: already at or near enough to fully closed position (%.3fV), not moving", current_voltage)
+            return None
 
         # Compute target: one increment down, but no lower than fully closed.
         # Same partial-increment logic as open_increment — move to fully closed
@@ -875,9 +974,24 @@ class pimc:
         result = self.run_until_voltage(target_voltage, direction='decreasing')
         self.stop_and_housekeeping()
 
+        # Read final position once and reuse for both voltage and percentage
+        # logging, avoiding two ADC reads that could return differing values
+        # due to pot wiper noise.
+        final_voltage = self.read_position()
+        final_pct = voltage_to_pct(final_voltage, self.voltage_fully_closed, self.voltage_fully_open)
+
         if not result:
-            self.logger.error("close_increment: failed to reach target voltage")
+            self.logger.error(
+                "close_increment: failed to reach target voltage. "
+                "final=%.3fV (%.1f%% open) target=%.3fV",
+                final_voltage, final_pct, target_voltage
+            )
             self.update_status("failed closing", use_future=False)
+        else:
+            self.logger.info(
+                "close_increment: move complete. final=%.3fV (%.1f%% open)",
+                final_voltage, final_pct
+            )
         return result
 
     def _require_position_sensor(self, action_name):
