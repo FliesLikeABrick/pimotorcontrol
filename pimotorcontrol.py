@@ -145,15 +145,28 @@ class MCP3008PositionSensor:
 #
 # The result is clamped to 0-100 to handle readings that drift slightly outside
 # the configured voltage range due to potentiometer wear or ADC noise.
+#
+# When voltage_tolerance is provided, readings within tolerance of either limit
+# are clamped to exactly 0.0 or 100.0, reflecting the same at-limit decision
+# that is_fully_open() and is_fully_closed() would make for the same reading.
 # -----------------------------------------------------------------------------
 
-def voltage_to_pct(voltage, voltage_fully_closed, voltage_fully_open):
+def voltage_to_pct(voltage, voltage_fully_closed, voltage_fully_open, voltage_tolerance=0.0):
     """Convert a potentiometer voltage reading to a percentage-open value.
 
     Calculates where the given voltage falls within the configured travel range
     (voltage_fully_closed to voltage_fully_open) and returns it as a percentage.
     Result is clamped to 0-100 to handle readings that drift slightly outside
     the configured range due to potentiometer wear or ADC noise.
+
+    When voltage_tolerance is provided, readings within that tolerance of either
+    limit are clamped to exactly 0.0 or 100.0. This reflects the real-world
+    behavior of the motor control logic: if the system considers the motor to be
+    fully open or fully closed (i.e. within tolerance of the limit), the reported
+    percentage should reflect that state rather than showing e.g. 98.3% when the
+    system has decided the motor is at the fully open position. Without this, the
+    percentage would appear to contradict the control decisions being logged and
+    emitted as telemetry events.
 
     This function does not read the ADC — the caller is responsible for
     providing a voltage reading. This allows callers that already have a cached
@@ -164,14 +177,30 @@ def voltage_to_pct(voltage, voltage_fully_closed, voltage_fully_open):
         voltage(float): The potentiometer voltage reading to convert, in volts.
         voltage_fully_closed(float): The voltage corresponding to 0% open (fully closed).
         voltage_fully_open(float): The voltage corresponding to 100% open (fully open).
+        voltage_tolerance(float): Acceptable margin in volts at either limit. Readings
+                                  within this tolerance of voltage_fully_open are reported
+                                  as 100.0%; readings within tolerance of voltage_fully_closed
+                                  are reported as 0.0%. Defaults to 0.0 for backward
+                                  compatibility with callers that do not pass tolerance.
 
     Returns:
-        pct(float): Percentage open, clamped to 0.0-100.0.
+        pct(float): Percentage open, clamped to 0.0-100.0. Exactly 0.0 or 100.0
+                    when within voltage_tolerance of either limit.
     """
     travel = voltage_fully_open - voltage_fully_closed
     if travel == 0:
         # Avoid division by zero if misconfigured thresholds are identical.
         return 0.0
+
+    # Apply tolerance clamping at limits before calculating percentage.
+    # This ensures the reported percentage reflects the same at-limit decision
+    # that is_fully_open() and is_fully_closed() would make for the same reading.
+    if voltage_tolerance > 0.0:
+        if voltage >= (voltage_fully_open - voltage_tolerance):
+            return 100.0
+        if voltage <= (voltage_fully_closed + voltage_tolerance):
+            return 0.0
+
     pct = (voltage - voltage_fully_closed) / travel * 100.0
     return max(0.0, min(100.0, pct))
 
@@ -640,26 +669,31 @@ class pimc:
 
         Convenience method for callers that want a percentage and do not already
         have a cached voltage reading. Calls read_position() once and passes the
-        result to voltage_to_pct().
+        result to voltage_to_pct() along with the configured voltage_tolerance,
+        so that readings within tolerance of either limit are reported as exactly
+        0.0% or 100.0% — consistent with the at-limit decisions made by
+        is_fully_open() and is_fully_closed().
 
         Callers that already have a fresh voltage reading (e.g. after a move
         completes) should call voltage_to_pct() directly with the cached value
         rather than calling this method, to avoid a second ADC read that could
         return a slightly different value due to pot wiper noise.
 
-        Requires position_sensor, voltage_fully_closed, and voltage_fully_open
-        to be configured at instantiation.
+        Requires position_sensor, voltage_fully_closed, voltage_fully_open,
+        and voltage_tolerance to be configured at instantiation.
 
         Args:
             None
 
         Returns:
             pct(float): Current position as percentage open, clamped to 0.0-100.0.
+                        Exactly 0.0 or 100.0 when within voltage_tolerance of either limit.
         """
         return voltage_to_pct(
             self.read_position(),
             self.voltage_fully_closed,
-            self.voltage_fully_open
+            self.voltage_fully_open,
+            self.voltage_tolerance,
         )
 
     def is_fully_open(self, current_voltage=None):
@@ -906,7 +940,7 @@ class pimc:
         # logging, avoiding two ADC reads that could return differing values
         # due to pot wiper noise.
         final_voltage = self.read_position()
-        final_pct = voltage_to_pct(final_voltage, self.voltage_fully_closed, self.voltage_fully_open)
+        final_pct = voltage_to_pct(final_voltage, self.voltage_fully_closed, self.voltage_fully_open, self.voltage_tolerance)
 
         if not result:
             self.logger.error(
@@ -978,7 +1012,7 @@ class pimc:
         # logging, avoiding two ADC reads that could return differing values
         # due to pot wiper noise.
         final_voltage = self.read_position()
-        final_pct = voltage_to_pct(final_voltage, self.voltage_fully_closed, self.voltage_fully_open)
+        final_pct = voltage_to_pct(final_voltage, self.voltage_fully_closed, self.voltage_fully_open, self.voltage_tolerance)
 
         if not result:
             self.logger.error(

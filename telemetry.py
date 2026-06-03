@@ -115,8 +115,7 @@ class TelemetryClient:
         # Elasticsearch API key auth uses the 'ApiKey' scheme with the
         # key value as provided by Kibana (id:api_key format, base64-encoded).
         import base64
-        encoded = base64.b64encode(api_key.encode()).decode()
-        self.auth_header = f"ApiKey {encoded}"
+        self.auth_header = f"ApiKey {api_key}"
 
         # Import requests here so that the import error is clear if the
         # library is not installed, rather than surfacing at emit() time.

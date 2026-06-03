@@ -23,10 +23,17 @@ from ds18b20 import ds18b20
 #   sample-and-respond cycle, then exits. There is no daemon loop here.
 #
 #   Example crontab entry (runs every 5 minutes):
-#     */5 * * * * /usr/bin/python3 /home/pi/greenhouse.py >> /var/log/greenhouse.log 2>&1
+#     */5 * * * * /usr/bin/python3 /home/pi/greenhouse.py --config greenhouse.yaml >> /var/log/greenhouse.log 2>&1
 #
 #   For verbose logging during testing:
-#     python3 greenhouse.py --debug
+#     python3 greenhouse.py --config greenhouse.yaml --debug
+#
+# CONFIGURATION:
+#
+#   All deployment-specific values (voltage thresholds, pin numbers, temperature
+#   thresholds, Elasticsearch credentials) live in greenhouse.yaml. CLI arguments
+#   override config file values when both are provided. Values absent from the
+#   config file fall back to argparse defaults.
 #
 # FAULT SAFETY AND JOURNAL FILE:
 #
@@ -39,57 +46,79 @@ from ds18b20 import ds18b20
 #   real-world consequences, the safest behavior is to stop acting and wait
 #   for a human to investigate and clear the fault manually.
 #
-#   To recover from a fault: inspect the journal file (default:
-#   greenhouse_status.json), address the root cause, then delete or reset
-#   the file. The controller will resume normal operation on the next
-#   cron invocation.
+#   To recover from a fault: inspect the journal file, address the root cause,
+#   then delete the journal file or set "status" to "ok" manually.
 #
 # TEMPERATURE FUNCTION:
 #
 #   The controller does not contain any temperature-reading logic. Instead,
 #   a callable is passed at instantiation. This callable takes no arguments
-#   and returns a float temperature in Fahrenheit. This decouples the
-#   controller from any specific sensor library or hardware, and makes it
-#   straightforward to test with a mock function.
-#
-#   Example using an existing DS18B20 read function:
-#     from my_sensor_module import read_temperature_f
-#     controller = GreenhouseVentController(motor=mc, get_temperature=read_temperature_f)
+#   and returns a float temperature in Fahrenheit.
 #
 # DEADBAND:
 #
-#   The controller uses a simple deadband to avoid hunting (rapidly
-#   opening and closing in response to small temperature fluctuations):
+#   The controller uses a simple deadband to avoid hunting:
 #
 #     temperature >= temp_open  => open one increment (unless fully open)
 #     temperature <= temp_close => close one increment (unless fully closed)
 #     temp_close < temperature < temp_open => do nothing
-#
-#   The gap between temp_close and temp_open is the deadband. Default is
-#   75F (close) to 85F (open), giving a 10F deadband.
 #
 # TELEMETRY:
 #
 #   If a TelemetryClient instance is provided at instantiation, the controller
 #   will emit events to Elasticsearch after each control cycle. Telemetry
 #   failures are non-fatal — a failure to emit never faults the controller.
-#   Telemetry is optional; if no client is provided, all emit calls are skipped.
-#
-#   Events are emitted to the pi-events index. All action, result, and
-#   event_type field values are prefixed with 'greenhouse_vent_' to namespace
-#   them within the shared index. This prevents field value collisions with
-#   other sources and makes Kibana queries unambiguous.
-#
-#   Event document fields:
-#     event_type:        'greenhouse_vent_action'
-#     action:            e.g. 'greenhouse_vent_opened_increment'
-#     result:            e.g. 'greenhouse_vent_success', 'greenhouse_vent_fault'
-#     level:             'info', 'warn', or 'error' (un-prefixed, generic severity)
-#     description:       human-readable context, mirrors the log message (un-prefixed,
-#                        free-text field — namespacing adds no value here)
-#     temperature_f:     the temperature reading that drove the decision
-#     position_voltage:  current ADC voltage at time of emit (if readable)
+#   Provide Elasticsearch credentials in greenhouse.yaml or via CLI args.
 # -----------------------------------------------------------------------------
+
+
+def load_config(config_path):
+    """Load and return a YAML configuration file as a dict.
+
+    If the file does not exist or cannot be parsed, logs an error and returns
+    an empty dict so that all values fall back to argparse defaults.
+
+    Args:
+        config_path(str): Path to the YAML config file.
+
+    Returns:
+        config(dict): Parsed config contents, or empty dict on failure.
+    """
+    try:
+        import yaml
+    except ImportError:
+        logging.error("PyYAML is not installed. Install with: pip install pyyaml --break-system-packages")
+        return {}
+
+    if not os.path.exists(config_path):
+        logging.error("Config file not found: %s", config_path)
+        return {}
+
+    try:
+        with open(config_path, 'r') as f:
+            return yaml.safe_load(f) or {}
+    except Exception as e:
+        logging.error("Failed to parse config file %s: %s", config_path, e)
+        return {}
+
+
+def cfg(config, *keys, default=None):
+    """Safely retrieve a nested value from a config dict.
+
+    Args:
+        config(dict): The config dict returned by load_config().
+        *keys: Sequence of keys to traverse, e.g. cfg(config, 'motor', 'vref').
+        default: Value to return if any key is missing. Defaults to None.
+
+    Returns:
+        value: The config value, or default if not found.
+    """
+    val = config
+    for key in keys:
+        if not isinstance(val, dict) or key not in val:
+            return default
+        val = val[key]
+    return val
 
 
 class GreenhouseVentController:
@@ -97,15 +126,9 @@ class GreenhouseVentController:
     # -------------------------------------------------------------------------
     # Telemetry field value constants
     # -------------------------------------------------------------------------
-    # All action, result, and event_type values are defined as class constants
-    # so that they are consistent across emit calls and easy to update if the
-    # naming convention changes. The 'greenhouse_vent_' prefix namespaces these
-    # values within the shared pi-events index.
-    #
-    # level values ('info', 'warn', 'error') and description are intentionally
-    # un-prefixed: level is a generic cross-source severity field (analogous to
-    # a log level) whose value as a common field depends on consistency across
-    # all sources; description is free-text and namespacing adds no value.
+    # All action, result, and event_type values are prefixed with
+    # 'greenhouse_vent_' to namespace them within the shared pi-events index.
+    # level values and description are intentionally un-prefixed.
     # -------------------------------------------------------------------------
     EVENT_TYPE = "greenhouse_vent_action"
 
@@ -127,34 +150,19 @@ class GreenhouseVentController:
         """Initialize the GreenhouseVentController.
 
         Args:
-            motor(pimc): An initialized pimc instance with a position_sensor
-                         configured. The motor's voltage limits and increment
-                         are set on the pimc instance, not here.
-            get_temperature(callable): A callable that takes no arguments and
-                                       returns the current temperature as a
-                                       float in Fahrenheit. This is intentionally
-                                       injected rather than hard-coded, so that
-                                       any sensor library or mock can be used
-                                       without modifying this class.
-            temp_open(float): Temperature in Fahrenheit at or above which the
-                              vents should be opened one increment. Default 85.0.
-            temp_close(float): Temperature in Fahrenheit at or below which the
-                               vents should be closed one increment. Default 75.0.
-            journal_file(str): Path to this controller's JSON journal file.
-                               Used to persist fault state across cron invocations.
-                               Distinct from pimc's own journal file. Default is
-                               'greenhouse_status.json' in the current directory.
-            telemetry(TelemetryClient or None): Optional TelemetryClient instance
-                               for emitting events to Elasticsearch. If None,
-                               telemetry is disabled and no emit calls are made.
-                               Telemetry failures are always non-fatal regardless.
+            motor(pimc): An initialized pimc instance with a position_sensor configured.
+            get_temperature(callable): A callable that takes no arguments and returns
+                                       the current temperature as a float in Fahrenheit.
+            temp_open(float): Temperature at or above which vents open one increment. Default 85.0F.
+            temp_close(float): Temperature at or below which vents close one increment. Default 75.0F.
+            journal_file(str): Path to this controller's JSON journal file. Default 'greenhouse_status.json'.
+            telemetry(TelemetryClient or None): Optional TelemetryClient for Elasticsearch. Default None.
             logger(obj): Logger to use. Uses root logger if None.
         """
         if temp_close >= temp_open:
             raise ValueError(
                 f"temp_close ({temp_close}F) must be less than temp_open ({temp_open}F) "
-                f"to create a valid deadband. With equal or reversed values, the controller "
-                f"would attempt to open and close simultaneously."
+                f"to create a valid deadband."
             )
 
         if not callable(get_temperature):
@@ -166,9 +174,7 @@ class GreenhouseVentController:
         if motor.position_sensor is None:
             raise ValueError(
                 "The provided pimc instance has no position_sensor configured. "
-                "GreenhouseVentController requires voltage-based position feedback. "
-                "Pass an MCP3008PositionSensor (or compatible object) as position_sensor "
-                "when constructing the pimc instance."
+                "GreenhouseVentController requires voltage-based position feedback."
             )
 
         self.motor = motor
@@ -182,37 +188,17 @@ class GreenhouseVentController:
     # -------------------------------------------------------------------------
     # Journal file format
     # -------------------------------------------------------------------------
-    # The journal is a small JSON file with the following structure:
-    #
     # Normal (no fault):
-    #   {
-    #     "status": "ok",
-    #     "last_run": "2024-06-01T14:35:00",
-    #     "last_temp_f": 82.4,
-    #     "last_action": "opened_increment"
-    #   }
+    #   { "status": "ok", "last_run": "...", "last_temp_f": 82.4, "last_action": "opened_increment" }
     #
     # Fault state:
-    #   {
-    #     "status": "fault",
-    #     "fault_time": "2024-06-01T14:35:00",
-    #     "fault_reason": "Motor fault during open_increment"
-    #   }
+    #   { "status": "fault", "fault_time": "...", "fault_reason": "..." }
     #
-    # The "status" key is the only one checked on startup. All other fields
-    # are informational and intended for human diagnosis.
-    #
-    # If the journal file does not exist, that is treated as a clean first run
-    # (not a fault). This makes initial deployment straightforward — no need
-    # to pre-create the file.
+    # If the journal file does not exist, that is treated as a clean first run.
     # -------------------------------------------------------------------------
 
     def _read_journal(self):
         """Read and return the journal file contents as a dict.
-
-        If the file does not exist, returns None (treated as first run, not fault).
-        If the file exists but cannot be parsed, logs an error and returns a
-        synthetic fault dict to prevent motor operation on a corrupt journal.
 
         Args:
             None
@@ -228,8 +214,6 @@ class GreenhouseVentController:
             with open(self.journal_file, 'r') as f:
                 return json.load(f)
         except (json.JSONDecodeError, OSError) as e:
-            # A corrupt or unreadable journal is treated as a fault condition.
-            # We cannot safely know the prior state, so we refuse to act.
             self.logger.error(
                 "Failed to read journal file %s: %s. Treating as fault to prevent "
                 "unsafe operation with unknown prior state.", self.journal_file, e
@@ -238,11 +222,6 @@ class GreenhouseVentController:
 
     def _write_journal(self, data):
         """Write a dict to the journal file as JSON, with OS sync for reliability.
-
-        Mirrors the write-and-sync pattern used in pimc for the same reasons:
-        on a Raspberry Pi that may lose power unexpectedly, an unsynced write
-        can leave a corrupt or empty file, which would then trigger the corrupt-
-        journal fault path on the next run.
 
         Args:
             data(dict): Data to write to the journal file.
@@ -255,18 +234,10 @@ class GreenhouseVentController:
                 json.dump(data, f, indent=2)
             os.sync()
         except OSError as e:
-            # Log but do not raise — a failed journal write should not itself
-            # cause a fault that prevents the controller from finishing its
-            # current cycle. The next run may behave unexpectedly without a
-            # journal, but that is preferable to crashing mid-operation.
             self.logger.error("Failed to write journal file %s: %s", self.journal_file, e)
 
     def _write_fault(self, reason):
         """Write a fault state to the journal file and log the condition.
-
-        After this is called, all subsequent cron invocations will read the
-        fault state and exit without touching the motor, until the fault is
-        manually cleared.
 
         Args:
             reason(str): Human-readable description of the fault condition.
@@ -286,14 +257,8 @@ class GreenhouseVentController:
         """Write a successful-run state to the journal file.
 
         Args:
-            temperature(float or None): The temperature reading from this run,
-                                        in Fahrenheit. The same value that drove
-                                        the control decision in check_and_adjust(),
-                                        passed through rather than re-read, so the
-                                        journal accurately reflects what caused the
-                                        action rather than a subsequent reading.
-            action(str): Description of the action taken this run (e.g. 'opened_increment',
-                         'closed_increment', 'no_action_deadband').
+            temperature(float or None): Temperature reading from this run, in Fahrenheit.
+            action(str): Description of the action taken this run.
 
         Returns:
             None
@@ -309,36 +274,16 @@ class GreenhouseVentController:
                     description=None, timestamp=None):
         """Emit a vent action event to Elasticsearch via the telemetry client.
 
-        Called after each control cycle outcome. Telemetry failures are logged
-        but never raised — a failure to emit must never fault the controller.
-
-        If no telemetry client is configured, this method is a no-op.
-
-        All action, result, and event_type values use the 'greenhouse_vent_'
-        prefix to namespace them within the shared pi-events index. Use the
-        class constants (ACTION_*, RESULT_*, EVENT_TYPE) rather than raw
-        strings to ensure consistency.
+        No-op if no telemetry client is configured. Failures are logged but
+        never raised — a failure to emit must never fault the controller.
 
         Args:
             action(str): What was attempted. Use ACTION_* class constants.
-                         e.g. self.ACTION_OPENED, self.ACTION_NO_ACTION
             result(str): Outcome of the action. Use RESULT_* class constants.
-                         e.g. self.RESULT_SUCCESS, self.RESULT_FAULT
-            temperature(float or None): The temperature reading that drove the
-                         decision, in Fahrenheit.
-            level(str):  Event severity. 'info' for normal actions, 'warn' for
-                         at-limit and deadband no-ops, 'error' for faults.
-                         Un-prefixed — this is a generic cross-source field.
-                         Defaults to 'info'.
-            description(str or None): Human-readable context for the event,
-                         mirroring the log message. Particularly useful for
-                         non-nominal outcomes where the action and result alone
-                         do not explain what happened. Un-prefixed free-text field.
-                         Defaults to None (omitted from document if not provided).
-            timestamp(str or datetime or None): Timestamp for the event. Should
-                         be passed as the moment the decision was made for accurate
-                         Kibana timeline alignment. If None, the telemetry client
-                         generates one at emit time.
+            temperature(float or None): Temperature reading that drove the decision.
+            level(str): Event severity: 'info', 'warn', or 'error'. Default 'info'.
+            description(str or None): Human-readable context. Default None.
+            timestamp(str or datetime or None): Event timestamp. Default None (generated at emit time).
 
         Returns:
             None
@@ -346,9 +291,9 @@ class GreenhouseVentController:
         if self.telemetry is None:
             return
 
-        # Read current position voltage once and reuse for both the voltage
-        # and percentage fields. Avoids two ADC reads returning slightly
-        # different values due to pot wiper noise.
+        # Read current position voltage once and reuse for both voltage and
+        # percentage fields, avoiding two ADC reads with potentially differing
+        # values due to pot wiper noise.
         position_voltage = None
         position_pct = None
         try:
@@ -356,7 +301,8 @@ class GreenhouseVentController:
             position_pct = voltage_to_pct(
                 position_voltage,
                 self.motor.voltage_fully_closed,
-                self.motor.voltage_fully_open
+                self.motor.voltage_fully_open,
+                self.motor.voltage_tolerance,
             )
         except Exception as e:
             self.logger.debug("_emit_event: could not read position for telemetry: %s", e)
@@ -385,23 +331,9 @@ class GreenhouseVentController:
     def check_and_adjust(self):
         """Perform one temperature sample-and-respond cycle.
 
-        This is the core logic method. It:
-          1. Reads the current temperature via get_temperature()
-          2. Evaluates against the deadband thresholds
-          3. Calls open_increment() or close_increment() on the motor if needed
-          4. Emits a telemetry event if a telemetry client is configured
-          5. Returns a tuple of (action, temperature)
-
-        Returning the temperature alongside the action avoids the need for a
-        second sensor read in run() when writing the journal. The temperature
-        in the journal should reflect the value that drove the control decision,
-        not a re-read taken moments later — particularly since re-reading adds
-        no useful information at the cron timescale and introduces an unnecessary
-        second point of failure.
-
-        This method is separated from run() so that it can be called and tested
-        independently without the journal read/write and exit logic that run()
-        adds for cron deployment.
+        Reads temperature, evaluates against deadband thresholds, calls
+        open_increment() or close_increment() if needed, emits telemetry,
+        and returns (action, temperature).
 
         Args:
             None
@@ -411,10 +343,9 @@ class GreenhouseVentController:
                 action(str): One of 'opened_increment', 'closed_increment',
                              'no_action_deadband', 'no_action_fully_open',
                              'no_action_fully_closed', or 'fault'.
-                temperature(float or None): The temperature reading taken this
-                             cycle, in Fahrenheit. None if the read failed.
+                temperature(float or None): Temperature reading in Fahrenheit,
+                             or None if the read failed.
         """
-        # Read temperature from the injected callable.
         try:
             temperature = self.get_temperature()
         except Exception as e:
@@ -447,9 +378,8 @@ class GreenhouseVentController:
                              temperature, self.temp_open)
 
             if self.motor.is_fully_open():
-                # Read position once, reuse for log and telemetry.
                 pos_v = self.motor.read_position()
-                pos_pct = voltage_to_pct(pos_v, self.motor.voltage_fully_closed, self.motor.voltage_fully_open)
+                pos_pct = voltage_to_pct(pos_v, self.motor.voltage_fully_closed, self.motor.voltage_fully_open, self.motor.voltage_tolerance)
                 self.logger.info(
                     "Vents are already fully open (%.3fV, %.1f%% open), no action taken",
                     pos_v, pos_pct
@@ -480,7 +410,7 @@ class GreenhouseVentController:
 
             elif result is None:
                 pos_v = self.motor.read_position()
-                pos_pct = voltage_to_pct(pos_v, self.motor.voltage_fully_closed, self.motor.voltage_fully_open)
+                pos_pct = voltage_to_pct(pos_v, self.motor.voltage_fully_closed, self.motor.voltage_fully_open, self.motor.voltage_tolerance)
                 self.logger.info(
                     "open_increment() reported already at limit (%.3fV, %.1f%% open), no movement occurred",
                     pos_v, pos_pct
@@ -511,9 +441,8 @@ class GreenhouseVentController:
                              temperature, self.temp_close)
 
             if self.motor.is_fully_closed():
-                # Read position once, reuse for log and telemetry.
                 pos_v = self.motor.read_position()
-                pos_pct = voltage_to_pct(pos_v, self.motor.voltage_fully_closed, self.motor.voltage_fully_open)
+                pos_pct = voltage_to_pct(pos_v, self.motor.voltage_fully_closed, self.motor.voltage_fully_open, self.motor.voltage_tolerance)
                 self.logger.info(
                     "Vents are already fully closed (%.3fV, %.1f%% open), no action taken",
                     pos_v, pos_pct
@@ -544,7 +473,7 @@ class GreenhouseVentController:
 
             elif result is None:
                 pos_v = self.motor.read_position()
-                pos_pct = voltage_to_pct(pos_v, self.motor.voltage_fully_closed, self.motor.voltage_fully_open)
+                pos_pct = voltage_to_pct(pos_v, self.motor.voltage_fully_closed, self.motor.voltage_fully_open, self.motor.voltage_tolerance)
                 self.logger.info(
                     "close_increment() reported already at limit (%.3fV, %.1f%% open), no movement occurred",
                     pos_v, pos_pct
@@ -571,10 +500,8 @@ class GreenhouseVentController:
                 return 'closed_increment', temperature
 
         else:
-            # Temperature is within the deadband. This is the expected steady-state
-            # outcome during a well-regulated day — most runs should land here.
             pos_v = self.motor.read_position()
-            pos_pct = voltage_to_pct(pos_v, self.motor.voltage_fully_closed, self.motor.voltage_fully_open)
+            pos_pct = voltage_to_pct(pos_v, self.motor.voltage_fully_closed, self.motor.voltage_fully_open, self.motor.voltage_tolerance)
             self.logger.info(
                 "Temperature %.1fF is within deadband (%.1fF - %.1fF), no action taken. "
                 "Current position: %.3fV (%.1f%% open)",
@@ -593,14 +520,8 @@ class GreenhouseVentController:
     def run(self):
         """Run one complete cron-invocation cycle.
 
-        This is the intended entry point when running from cron. It:
-          1. Checks the journal for a prior fault state and exits immediately if found
-          2. Calls check_and_adjust() to evaluate temperature and act
-          3. Writes the outcome to the journal (fault or ok)
-          4. Exits with status code 0 on success, 1 on fault
-
-        Faults cause an immediate exit with sys.exit(1), which cron can be
-        configured to alert on (e.g. MAILTO in crontab).
+        Checks for prior fault, calls check_and_adjust(), writes journal,
+        exits with 0 on success or 1 on fault.
 
         Args:
             None
@@ -608,16 +529,6 @@ class GreenhouseVentController:
         Returns:
             None (exits the process)
         """
-        # --- Check for prior fault state ---
-        #
-        # If a prior run wrote a fault to the journal, we refuse to operate
-        # until the fault is manually cleared. This is a deliberate safety
-        # choice: we do not know what state the physical system is in after
-        # a fault, and taking further automated action could make things worse.
-        #
-        # To clear a fault: investigate the logged reason, address the root
-        # cause, verify the physical vent position is safe, then delete the
-        # journal file or set "status" to "ok" manually.
         journal = self._read_journal()
         if journal is not None and journal.get("status") == "fault":
             self.logger.error(
@@ -628,18 +539,12 @@ class GreenhouseVentController:
             )
             sys.exit(1)
 
-        # --- Run the control cycle ---
         action, temperature = self.check_and_adjust()
 
         if action == 'fault':
-            # check_and_adjust already logged the specific error.
-            # Write fault to journal so subsequent runs also abort.
             self._write_fault("check_and_adjust returned fault — see prior log entries for details")
             sys.exit(1)
 
-        # The temperature passed here is the same value that drove the control
-        # decision — not a re-read. See _write_ok() and check_and_adjust() for
-        # the reasoning.
         self._write_ok(temperature, action)
         self.logger.info("Run complete. Action: %s", action)
         sys.exit(0)
@@ -656,25 +561,34 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  python3 greenhouse.py                        # normal cron run
-  python3 greenhouse.py --debug                # verbose logging for testing
-  python3 greenhouse.py --es-host 172.28.11.170 --es-api-key <key>  # with telemetry
+  python3 greenhouse.py --config greenhouse.yaml
+  python3 greenhouse.py --config greenhouse.yaml --debug
+  python3 greenhouse.py --config greenhouse.yaml --temp-open 80 --temp-close 70
         """
     )
 
+    parser.add_argument("--config", action="store", default=None,
+                        help="Path to YAML config file. CLI args override config values.")
     parser.add_argument("--debug", action="store_true",
                         help="Enable verbose debug logging.")
 
     # --- Telemetry args ---
-    # These are optional. If --es-api-key is not provided, telemetry is disabled
-    # and the controller runs normally without emitting to Elasticsearch.
-    parser.add_argument("--es-host", action="store", default="localhost",
-                        help="Elasticsearch host for telemetry (default: localhost).")
-    parser.add_argument("--es-port", action="store", type=int, default=9200,
-                        help="Elasticsearch port for telemetry (default: 9200).")
+    parser.add_argument("--es-host", action="store", default=None,
+                        help="Elasticsearch host. Overrides config file.")
+    parser.add_argument("--es-port", action="store", type=int, default=None,
+                        help="Elasticsearch port. Overrides config file.")
     parser.add_argument("--es-api-key", action="store", default=None,
-                        help="Elasticsearch API key for telemetry. "
-                             "If not provided, telemetry is disabled.")
+                        help="Elasticsearch API key. Overrides config file.")
+
+    # --- Controller args ---
+    parser.add_argument("--temp-open", action="store", type=float, default=None,
+                        help="Temperature threshold to open vents (F). Overrides config.")
+    parser.add_argument("--temp-close", action="store", type=float, default=None,
+                        help="Temperature threshold to close vents (F). Overrides config.")
+    parser.add_argument("--journal-file", action="store", default=None,
+                        help="Path to greenhouse controller journal file. Overrides config.")
+    parser.add_argument("--pimc-journal", action="store", default=None,
+                        help="Path to pimc motor controller journal file. Overrides config.")
 
     args = parser.parse_args()
 
@@ -682,25 +596,75 @@ examples:
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s %(levelname)s: %(message)s"
     )
-
     logger = logging.getLogger(__name__)
 
+    # --- Load config file ---
+    config = {}
+    if args.config:
+        config = load_config(args.config)
+
+    # --- Resolve values: CLI args take precedence over config, config over defaults ---
+    def resolve(cli_val, *config_keys, default=None):
+        """Return CLI value if provided, else config value, else default."""
+        if cli_val is not None:
+            return cli_val
+        config_val = cfg(config, *config_keys)
+        return config_val if config_val is not None else default
+
+    es_host    = resolve(args.es_host,    'elasticsearch', 'host',    default='localhost')
+    es_port    = resolve(args.es_port,    'elasticsearch', 'port',    default=9200)
+    es_api_key = resolve(args.es_api_key, 'elasticsearch', 'api_key', default=None)
+
+    temp_open    = resolve(args.temp_open,    'controller', 'temp_open',    default=85.0)
+    temp_close   = resolve(args.temp_close,   'controller', 'temp_close',   default=75.0)
+    journal_file = resolve(args.journal_file, 'controller', 'journal_file', default='greenhouse_status.json')
+    pimc_journal = resolve(args.pimc_journal, 'controller', 'pimc_journal', default='pimc_status')
+
+    # Motor / ADC values — no CLI overrides for these, config or defaults only.
+    voltage_fully_closed     = cfg(config, 'motor', 'voltage_fully_closed',     default=None)
+    voltage_fully_open       = cfg(config, 'motor', 'voltage_fully_open',       default=None)
+    voltage_increment        = cfg(config, 'motor', 'voltage_increment',        default=None)
+    voltage_tolerance        = cfg(config, 'motor', 'voltage_tolerance',        default=0.1)
+    direction_fault_threshold= cfg(config, 'motor', 'direction_fault_threshold',default=0.1)
+    direction_settle_seconds = cfg(config, 'motor', 'direction_settle_seconds', default=0.1)
+    poll_interval_seconds    = cfg(config, 'motor', 'poll_interval_seconds',    default=0.01)
+    maxtime                  = cfg(config, 'motor', 'maxtime',                  default=30)
+    ch1_pin                  = cfg(config, 'motor', 'ch1_pin',                  default=26)
+    ch2_pin                  = cfg(config, 'motor', 'ch2_pin',                  default=20)
+    relay_mode               = cfg(config, 'motor', 'relay_mode',               default='independent')
+
+    vref        = cfg(config, 'adc', 'vref',    default=None)
+    adc_channel = cfg(config, 'adc', 'channel', default=0)
+
+    # Validate required values that have no safe default.
+    missing = [name for name, val in [
+        ('motor.voltage_fully_closed', voltage_fully_closed),
+        ('motor.voltage_fully_open',   voltage_fully_open),
+        ('motor.voltage_increment',    voltage_increment),
+        ('motor.relay_mode',           relay_mode),
+        ('adc.vref',                   vref),
+    ] if val is None]
+    if missing:
+        logger.error(
+            "The following required values are missing from the config file and "
+            "have no CLI override: %s", ', '.join(missing)
+        )
+        sys.exit(1)
+
     # --- Telemetry client ---
-    # Only instantiated if --es-api-key is provided. Telemetry is optional —
-    # the controller runs normally without it.
     telemetry = None
-    if args.es_api_key:
+    if es_api_key:
         from telemetry import TelemetryClient
         telemetry = TelemetryClient(
-            api_key=args.es_api_key,
-            host=args.es_host,
-            port=args.es_port,
+            api_key=es_api_key,
+            host=es_host,
+            port=es_port,
             source="greenhouse",
             logger=logger,
         )
-        logger.info("Telemetry enabled. host=%s port=%s", args.es_host, args.es_port)
+        logger.info("Telemetry enabled. host=%s port=%s", es_host, es_port)
     else:
-        logger.debug("No --es-api-key provided, telemetry disabled.")
+        logger.debug("No Elasticsearch API key configured, telemetry disabled.")
 
     # --- Temperature sensor ---
     def get_temperature():
@@ -708,26 +672,23 @@ examples:
         return d.get_temperature(unit=2)
 
     # --- ADC position sensor ---
-    sensor = MCP3008PositionSensor(channel=0, vref=3.3)
+    sensor = MCP3008PositionSensor(channel=adc_channel, vref=vref)
 
     # --- Motor controller ---
-    #
-    # All values are in volts. Measure with a multimeter or by reading the ADC
-    # directly:
-    #   python3 -c "from pimotorcontrol import MCP3008PositionSensor; s = MCP3008PositionSensor(vref=3.3); print(s.read())"
     motor = pimc(
-        journal_filename="pimc_status",
+        journal_filename=pimc_journal,
         position_sensor=sensor,
-        voltage_fully_closed=1.95,
-        voltage_fully_open=2.3,
-        voltage_increment=0.25,
-        voltage_tolerance=0.1,
-        direction_fault_threshold=0.3,
-        direction_settle_seconds=0.02,
-        maxtime=2,
-        ch1_pin=21,
-        ch2_pin=20,
-        relay_mode="enable_direction",
+        voltage_fully_closed=voltage_fully_closed,
+        voltage_fully_open=voltage_fully_open,
+        voltage_increment=voltage_increment,
+        voltage_tolerance=voltage_tolerance,
+        direction_fault_threshold=direction_fault_threshold,
+        direction_settle_seconds=direction_settle_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+        maxtime=maxtime,
+        ch1_pin=ch1_pin,
+        ch2_pin=ch2_pin,
+        relay_mode=relay_mode,
         logger=logger,
     )
 
@@ -735,9 +696,9 @@ examples:
     controller = GreenhouseVentController(
         motor=motor,
         get_temperature=get_temperature,
-        temp_open=85.0,
-        temp_close=75.0,
-        journal_file="greenhouse_status.json",
+        temp_open=temp_open,
+        temp_close=temp_close,
+        journal_file=journal_file,
         telemetry=telemetry,
         logger=logger,
     )

@@ -1,50 +1,50 @@
 import argparse
 import logging
+import os
 import sys
 
 from pimotorcontrol import MCP3008PositionSensor, voltage_to_pct
 from ds18b20 import ds18b20
 from telemetry import TelemetryClient
+from greenhouse import load_config, cfg
 
 # -----------------------------------------------------------------------------
 # greenhouse_metrics.py - Periodic greenhouse metric telemetry emitter
 # -----------------------------------------------------------------------------
 #
-# This script reads temperature and optionally vent position voltage from the
-# greenhouse Pi and emits them as a metric document to Elasticsearch.
+# Reads temperature and optionally vent position voltage from the greenhouse Pi
+# and emits them as a metric document to Elasticsearch.
 #
-# It is intentionally separate from greenhouse.py (the vent controller) because:
-#   - Metric sampling and vent control run on independent intervals. Temperature
-#     may be sampled every minute for graph resolution while vent control runs
-#     every 5 minutes.
-#   - A telemetry failure should never gate vent control. Keeping them separate
-#     means a failure here has no effect on the vent controller's cron job.
+# Intentionally separate from greenhouse.py because:
+#   - Metric sampling and vent control run on independent intervals.
+#   - A telemetry failure here must never affect the vent controller cron job.
 #
 # INTENDED USAGE (cronjob):
 #
-#   Example crontab entries:
-#     */1 * * * * /usr/bin/python3 /home/pi/greenhouse_metrics.py --es-host 172.28.11.170 --es-api-key <key> >> /var/log/greenhouse_metrics.log 2>&1
-#     */5 * * * * /usr/bin/python3 /home/pi/greenhouse.py --es-host 172.28.11.170 --es-api-key <key> >> /var/log/greenhouse.log 2>&1
+#   */1 * * * * python3 /home/pi/greenhouse_metrics.py --config greenhouse.yaml >> /var/log/greenhouse_metrics.log 2>&1
+#   */5 * * * * python3 /home/pi/greenhouse.py --config greenhouse.yaml >> /var/log/greenhouse.log 2>&1
 #
-# DOCUMENT FORMAT:
+# CONFIGURATION:
 #
-#   Emits to the pi-metrics index with named fields:
-#     {
-#       "@timestamp":      "...",    # time of reading, generated on the Pi
-#       "host":            "pi-greenhouse",
-#       "source":          "greenhouse",
-#       "temperature_f":   82.4,     # always present if sensor is readable
-#       "position_voltage": 2.14     # present only if --vref is provided
-#     }
+#   Shares greenhouse.yaml with greenhouse.py. CLI args override config values.
+#   --es-api-key is required either via config or CLI.
+#   --vref enables ADC position reading; if absent only temperature is emitted.
 #
-#   temperature_f and position_voltage use the same field names as pi-events
-#   documents from greenhouse.py, allowing cross-index Kibana queries on these
-#   fields to return both periodic readings and event-driven readings together.
+# DOCUMENT FORMAT (pi-metrics index):
+#
+#   {
+#     "@timestamp":      "...",
+#     "host":            "pi-greenhouse",
+#     "source":          "greenhouse",
+#     "temperature_f":   82.4,
+#     "position_voltage": 2.14,   # only when --vref / adc.vref is configured
+#     "position_pct":    65.0     # only when voltage limits are also configured
+#   }
 # -----------------------------------------------------------------------------
 
 
 def read_temperature():
-    """Read current temperature from the DS18B20 sensor.
+    """Read current temperature from the DS18B20 sensor in Fahrenheit.
 
     Args:
         None
@@ -58,53 +58,45 @@ def read_temperature():
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Greenhouse metric telemetry emitter. "
-                    "Reads temperature and optionally vent position and emits to Elasticsearch.",
+        description="Greenhouse metric telemetry emitter.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
-  # temperature only
+  # using config file (recommended)
+  python3 greenhouse_metrics.py --config greenhouse.yaml
+
+  # temperature only, no config file
   python3 greenhouse_metrics.py --es-host 172.28.11.170 --es-api-key <key>
 
-  # temperature and vent position voltage
-  python3 greenhouse_metrics.py --es-host 172.28.11.170 --es-api-key <key> --vref 3.3 --fully-closed-voltage 1.75 --fully-open-voltage 2.3
+  # with position voltage and percentage
+  python3 greenhouse_metrics.py --config greenhouse.yaml --vref 3.3
 
   # verbose logging
-  python3 greenhouse_metrics.py --es-host 172.28.11.170 --es-api-key <key> --debug
+  python3 greenhouse_metrics.py --config greenhouse.yaml --debug
         """
     )
 
+    parser.add_argument("--config", action="store", default=None,
+                        help="Path to YAML config file. CLI args override config values.")
     parser.add_argument("--debug", action="store_true",
                         help="Enable verbose debug logging.")
 
     # --- Telemetry args ---
-    parser.add_argument("--es-host", action="store", default="localhost",
-                        help="Elasticsearch host (default: localhost).")
-    parser.add_argument("--es-port", action="store", type=int, default=9200,
-                        help="Elasticsearch port (default: 9200).")
-    parser.add_argument("--es-api-key", action="store", required=True,
-                        help="Elasticsearch API key. REQUIRED.")
+    parser.add_argument("--es-host", action="store", default=None,
+                        help="Elasticsearch host. Overrides config file.")
+    parser.add_argument("--es-port", action="store", type=int, default=None,
+                        help="Elasticsearch port. Overrides config file.")
+    parser.add_argument("--es-api-key", action="store", default=None,
+                        help="Elasticsearch API key. Overrides config file.")
 
     # --- ADC args ---
-    # --vref is optional. If provided, vent position voltage is read from the
-    # MCP3008 and included in the metric document. If absent, only temperature
-    # is emitted. This allows the script to run even if the ADC is not wired
-    # or available.
+    # --vref enables position voltage reading. If absent, only temperature is emitted.
+    # Voltage limits are read from config to compute position_pct.
     parser.add_argument("--vref", action="store", type=float, default=None,
-                        help="ADC reference voltage in volts. If provided, vent position "
-                             "voltage is read from the MCP3008 and included in the metric "
-                             "document. Must match the MCP3008 VREF pin voltage exactly. "
-                             "If not provided, only temperature is emitted.")
-    parser.add_argument("--adc-channel", action="store", type=int, default=0,
-                        help="MCP3008 analog input channel (default: 0).")
-    parser.add_argument("--fully-closed-voltage", action="store", type=float, default=None,
-                        help="Voltage at the fully closed position, in volts. Required to "
-                             "calculate position_pct alongside position_voltage. "
-                             "Must match the value configured in greenhouse.py.")
-    parser.add_argument("--fully-open-voltage", action="store", type=float, default=None,
-                        help="Voltage at the fully open position, in volts. Required to "
-                             "calculate position_pct alongside position_voltage. "
-                             "Must match the value configured in greenhouse.py.")
+                        help="ADC reference voltage in volts. Overrides config adc.vref. "
+                             "If provided, vent position voltage and percentage are included.")
+    parser.add_argument("--adc-channel", action="store", type=int, default=None,
+                        help="MCP3008 analog input channel. Overrides config adc.channel.")
 
     args = parser.parse_args()
 
@@ -114,22 +106,51 @@ examples:
     )
     logger = logging.getLogger(__name__)
 
+    # --- Load config file ---
+    config = {}
+    if args.config:
+        config = load_config(args.config)
+
+    # --- Resolve values ---
+    def resolve(cli_val, *config_keys, default=None):
+        if cli_val is not None:
+            return cli_val
+        config_val = cfg(config, *config_keys)
+        return config_val if config_val is not None else default
+
+    es_host    = resolve(args.es_host,    'elasticsearch', 'host',    default='localhost')
+    es_port    = resolve(args.es_port,    'elasticsearch', 'port',    default=9200)
+    es_api_key = resolve(args.es_api_key, 'elasticsearch', 'api_key', default=None)
+
+    vref        = resolve(args.vref,        'adc', 'vref',    default=None)
+    adc_channel = resolve(args.adc_channel, 'adc', 'channel', default=0)
+
+    # Voltage limits — needed for position_pct calculation.
+    voltage_fully_closed = cfg(config, 'motor', 'voltage_fully_closed', default=None)
+    voltage_fully_open   = cfg(config, 'motor', 'voltage_fully_open',   default=None)
+    voltage_tolerance    = cfg(config, 'motor', 'voltage_tolerance',    default=0.0)
+
+    # --- Validate required values ---
+    if not es_api_key:
+        logger.error(
+            "Elasticsearch API key is required. Provide via --es-api-key or "
+            "elasticsearch.api_key in the config file."
+        )
+        sys.exit(1)
+
     # --- Telemetry client ---
     telemetry = TelemetryClient(
-        api_key=args.es_api_key,
-        host=args.es_host,
-        port=args.es_port,
+        api_key=es_api_key,
+        host=es_host,
+        port=es_port,
         source="greenhouse",
         logger=logger,
     )
 
     # --- Build metric document ---
-    # Read all sensors first, then emit once. This ensures the document
-    # represents a single point in time as closely as possible, and that
-    # @timestamp (generated by the telemetry client at emit time) reflects
-    # when the readings were taken rather than after any processing.
+    # Read all sensors first, then emit once. This keeps @timestamp as close
+    # as possible to the actual moment of reading.
     document = {}
-    success = True
 
     # Temperature — always attempted.
     try:
@@ -138,32 +159,40 @@ examples:
         logger.info("Temperature: %.1fF", temperature_f)
     except Exception as e:
         logger.error("Failed to read temperature: %s", e)
-        success = False
 
-    # Position voltage — only if --vref was provided.
-    if args.vref is not None:
+    # Position voltage and percentage — only if vref is configured.
+    if vref is not None:
         try:
-            sensor = MCP3008PositionSensor(channel=args.adc_channel, vref=args.vref)
+            sensor = MCP3008PositionSensor(channel=adc_channel, vref=vref)
             position_voltage = sensor.read()
             sensor.close()
             document["position_voltage"] = position_voltage
+
             # Compute percentage from the cached reading rather than re-reading
             # the ADC, to avoid a second read returning a different value due to
-            # pot wiper noise. Requires --fully-closed-voltage and
-            # --fully-open-voltage to be provided.
-            if args.fully_closed_voltage is not None and args.fully_open_voltage is not None:
-                position_pct = voltage_to_pct(position_voltage, args.fully_closed_voltage, args.fully_open_voltage)
+            # pot wiper noise. Requires voltage limits from config.
+            if voltage_fully_closed is not None and voltage_fully_open is not None:
+                position_pct = voltage_to_pct(
+                    position_voltage,
+                    voltage_fully_closed,
+                    voltage_fully_open,
+                    voltage_tolerance,
+                )
                 document["position_pct"] = round(position_pct, 1)
                 logger.info("Position voltage: %.3fV (%.1f%% open)", position_voltage, position_pct)
             else:
-                logger.info("Position voltage: %.3fV (percentage unavailable — provide --fully-closed-voltage and --fully-open-voltage)", position_voltage)
+                logger.info(
+                    "Position voltage: %.3fV (percentage unavailable — "
+                    "motor.voltage_fully_closed and motor.voltage_fully_open "
+                    "must be set in the config file)",
+                    position_voltage
+                )
         except Exception as e:
             logger.error("Failed to read position voltage: %s", e)
             # Not fatal — emit temperature without position if ADC read fails.
 
     # --- Emit ---
     if not document:
-        # Nothing to emit — all reads failed.
         logger.error("No metrics collected, nothing to emit.")
         sys.exit(1)
 
