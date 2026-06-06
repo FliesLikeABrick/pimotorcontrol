@@ -662,7 +662,9 @@ class pimc:
         Returns:
             voltage(float): Current position in volts as returned by the sensor.
         """
-        return self.position_sensor.read()
+        voltage = self.position_sensor.read()
+        self.logger.debug("read_position: %.3fV", voltage)
+        return voltage
 
     def read_position_pct(self):
         """Read the current motor position as a percentage open.
@@ -710,7 +712,13 @@ class pimc:
             result(bool): True if current position is within tolerance of fully open
                           or beyond it. """
         current_voltage = current_voltage if current_voltage is not None else self.read_position()
-        return current_voltage >= (self.voltage_fully_open - self.voltage_tolerance)
+        result = current_voltage >= (self.voltage_fully_open - self.voltage_tolerance)
+        self.logger.debug(
+            "is_fully_open: voltage=%.3fV threshold=%.3fV (fully_open=%.3fV - tolerance=%.3fV) => %s",
+            current_voltage, self.voltage_fully_open - self.voltage_tolerance,
+            self.voltage_fully_open, self.voltage_tolerance, result
+        )
+        return result
 
     def is_fully_closed(self, current_voltage=None):
         """Determine whether the motor is at or past the fully closed position.
@@ -725,7 +733,13 @@ class pimc:
                           or beyond it.
         """
         current_voltage = current_voltage if current_voltage is not None else self.read_position()
-        return current_voltage <= (self.voltage_fully_closed + self.voltage_tolerance)
+        result = current_voltage <= (self.voltage_fully_closed + self.voltage_tolerance)
+        self.logger.debug(
+            "is_fully_closed: voltage=%.3fV threshold=%.3fV (fully_closed=%.3fV + tolerance=%.3fV) => %s",
+            current_voltage, self.voltage_fully_closed + self.voltage_tolerance,
+            self.voltage_fully_closed, self.voltage_tolerance, result
+        )
+        return result
 
     def run_until_voltage(self, target_voltage, direction):
         """Run the motor until the ADC reads within tolerance of a target voltage.
